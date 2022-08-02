@@ -35,6 +35,7 @@ from sklearn.metrics import auc, plot_precision_recall_curve
 from torchmetrics import PrecisionRecallCurve, AUROC
 from torchmetrics.functional import auc
 from sklearn.metrics import classification_report, confusion_matrix
+import seaborn as sns
 
 
 comet_params = dict(
@@ -162,9 +163,9 @@ class TransformerClassifier(pl.LightningModule):
         return loss, accuracy
       
     def training_step(self, batch, batch_idx):
-        if len(self.labels) > 0:
-            self.preds = []
-            self.labels = []
+        # if len(self.labels) > 0:
+        #     self.preds = []
+        #     self.labels = []
         loss, accuracy = self.common_step(batch, batch_idx, test=False)     
         # logs metrics for each training_step,
         # and the average across the epoch
@@ -226,6 +227,7 @@ class TransformerClassifier(pl.LightningModule):
         all_labels = []
         all_preds = []
         all_logits = []
+        category_names = ["Real", "Fake"]
         for out in outputs:
             for logits, label in zip(*out):
                 predictions = torch.round(torch.squeeze(logits))
@@ -245,22 +247,23 @@ class TransformerClassifier(pl.LightningModule):
         script_name = '/home/ubuntu/rebag/code/transformer/script'
         stats.to_csv(os.path.join(script_name, 'stats.csv'), index=False)
         TransformerClassifier.draw_sensitivity_and_specificity(stats, self.logger, script_name)
+        TransformerClassifier.plot_confusion_matrix(conf_mat, category_names, script_name)
 
         sensitivity = float(conf_mat[1][1]) / (conf_mat[1][1] + conf_mat[1][0])
         specificity = float(conf_mat[0][0]) / (conf_mat[0][0] + conf_mat[0][1])
         trustworthy_real_predictions = float(conf_mat[0][0]) / (conf_mat[0][0] + conf_mat[1][0])
-        self.logger.log_confusion_matrix(matrix=conf_mat, labels=all_labels)
+        # self.logger.log_confusion_matrix(matrix=conf_mat, labels=all_labels)
 
-        self.logger.log_table("stats.csv", tabular_data=stats)
-        self.logger.log_metric('test_accuracy', sklearn.metrics.accuracy_score(all_labels, all_preds))
-        self.logger.log_metric('test_recall', sklearn.metrics.recall_score(all_labels, all_preds))
-        self.logger.log_metric('sensitivity_at_0.5', sensitivity)
-        self.logger.log_metric('specificity_at_0.5', specificity)
-        self.logger.log_metric('trustworthy_real_predictions', trustworthy_real_predictions)
+        # self.logger.log_table("stats.csv", tabular_data=stats)
+        self.logger.log_metrics({'test_accuracy': sklearn.metrics.accuracy_score(all_labels, all_preds)})
+        self.logger.log_metrics({'test_recall': sklearn.metrics.recall_score(all_labels, all_preds)})
+        self.logger.log_metrics({'sensitivity_at_0.5': sensitivity})
+        self.logger.log_metrics({'specificity_at_0.5': specificity})
+        self.logger.log_metrics({'trustworthy_real_predictions': trustworthy_real_predictions})
         if tpr is not None and fpr is not None:
-            self.logger.log_curve("roc-curve", fpr, tpr)
-            self.logger.log_metric("roc-auc", sklearn.metrics.auc(fpr, tpr))
-        self.logger.log_dataset_info("transformer_models")
+            # self.logger.log_curve("roc-curve", fpr, tpr)
+            self.logger.log_metrics({"test-roc-auc": sklearn.metrics.auc(fpr, tpr)})
+        # self.logger.log_dataset_info("transformer_models")
 
 
         # print(f"Test_preds: {len(all_preds)}")
@@ -279,9 +282,19 @@ class TransformerClassifier(pl.LightningModule):
         plt.legend(['sensitivity', 'specificity'])
         plt.savefig(sensitivity_specificity_path)
         plt.close()
-        if experiment:
-            experiment.log_graph(sensitivity_specificity_path, "sensitivity_and_specificity.png")
+        # if experiment:
+        #     experiment.log_graph(sensitivity_specificity_path, "sensitivity_and_specificity.png")
 
+    @staticmethod
+    def plot_confusion_matrix(cnf_mat, category_names, path):
+        plt.figure(figsize=(6, 6))
+        plt.title("Confusion Matrix")
+        sns.heatmap(cnf_mat, annot=True, cbar=False, linewidth=0.5, fmt="d")
+        plt.xticks(np.arange(len(category_names)) + 0.5, category_names)
+        plt.yticks(np.arange(len(category_names)) + 0.5, category_names)
+        plt.ylabel("Actual Category")
+        plt.xlabel("Predicted Category")
+        plt.savefig(os.path.join(path, 'conf_matrix.png'))
 
     @staticmethod
     def create_auth_report(y_true, y_pred, threshold):
@@ -377,7 +390,7 @@ if __name__ == '__main__':
     # os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
     early_stop_callback = EarlyStopping(
         monitor='validation_loss',
-        patience=3,
+        patience=6,
         strict=False,
         verbose=True,
         mode='min'
@@ -391,13 +404,7 @@ if __name__ == '__main__':
     checkpoint_callback = ModelCheckpoint(monitor="val_pr_auc")
 
     model = TransformerClassifier()
-    trainer = Trainer(logger=comet_logger, gpus=1, callbacks=[early_stop_callback, checkpoint_callback], max_epochs=1, default_root_dir='./', log_every_n_steps=10)
-    model.labels = []
-    model.preds = []
+    trainer = Trainer(logger=comet_logger, gpus=1, callbacks=[early_stop_callback, checkpoint_callback], max_epochs=25, default_root_dir='./', log_every_n_steps=10)
     trainer.fit(model)
     trainer.test(ckpt_path='best')
-    # auroc = AUROC(pos_label=1)
-    # roc_auc = auroc(torch.cat(model.preds), torch.cat(model.labels))
-    # comet_logger.log_metrics({"test_roc_auc": roc_auc})
-    # print(f"roc_auc: {roc_auc}")
 
