@@ -1,8 +1,9 @@
 from comet_ml import Experiment, OfflineExperiment, ExistingOfflineExperiment
 from PIL import Image
 import ast
+import os
 import matplotlib.pyplot as plt
-import cv2
+import sklearn
 import torch
 import torchvision.transforms as transforms
 from transformers import ViTFeatureExtractor
@@ -21,30 +22,40 @@ from datasets import load_metric
 import numpy as np
 import pandas as pd
 from torch.utils.data import Dataset
-from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 import pytorch_lightning as pl
 from transformers import ViTForImageClassification, AdamW
 import torch.nn as nn
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import EarlyStopping
 from pytorch_lightning import loggers as pl_loggers
+import torchmetrics
+from pytorch_lightning.callbacks import ModelCheckpoint
+from sklearn.metrics import average_precision_score, precision_recall_curve
+from sklearn.metrics import auc, plot_precision_recall_curve
+from torchmetrics import PrecisionRecallCurve, AUROC
+from torchmetrics.functional import auc
+from sklearn.metrics import classification_report, confusion_matrix
+
 
 comet_params = dict(
-    workspace="fusemachines",
-    project_name="rebag",
-    api_key="GPmdVRWMxsPYqrLK5uXYeIK2U",
+    save_dir='./comet',
+    offline=True,
+    workspace="",
+    project_name="",
+    api_key="",
     auto_metric_logging=True,
     auto_param_logging=True,
+    experiment_name = "transformer_on_brand_code_only_old_data"
 )
 
-experiment = OfflineExperiment(
-    offline_directory='./comet',
-    **comet_params
-)
+# experiment = OfflineExperiment(
+#     offline_directory='./comet',
+#     **comet_params
+# )
 
 train_batch_size = 64
 eval_batch_size = 64
-comet_logger = pl_loggers.CometLogger(save_dir="./comet/")
+comet_logger = pl_loggers.CometLogger(**comet_params)
 
 feature_extractor = ViTFeatureExtractor.from_pretrained("google/vit-base-patch16-224-in21k")
 # print(feature_extractor.size)
@@ -114,53 +125,206 @@ class Collate:
         return {"pixel_values": bag_tensor, "labels": labels_tensor}
 
 
-class ViTLightningModule(pl.LightningModule):
-    def __init__(self, num_labels=2):
-        super(ViTLightningModule, self).__init__()
+class TransformerClassifier(pl.LightningModule):
+    def __init__(self, num_labels=1):
+        super(TransformerClassifier, self).__init__()
         self.vit = ViTForImageClassification.from_pretrained('google/vit-base-patch16-224-in21k',
-                                                              num_labels=2,
-                                                              id2label={0:"Real", 1:"Fake"},
-                                                              label2id={"Real":0, "Fake":1})
+                                                              num_labels=1,
+                                                              id2label={0:"Real"},
+                                                              label2id={"Real":0})
+        self.sig = nn.Sigmoid()
+        # self.preds = []
+        # self.labels = []
 
     def forward(self, pixel_values):
         outputs = self.vit(pixel_values=pixel_values)
-        return outputs.logits
+        return self.sig(outputs.logits)
         
     def common_step(self, batch, batch_idx, test=False):
         pixel_values = batch['pixel_values']
         labels = batch['labels']
         logits = self(pixel_values)
 
-        criterion = nn.CrossEntropyLoss()
-        loss = criterion(logits, labels)
-        predictions = logits.argmax(-1)
+        criterion = nn.BCELoss()
+        # print(logits)
+        loss = criterion(torch.reshape(logits, (-1, 1)), torch.reshape(labels, (-1,1)).float())
+        predictions = torch.round(torch.squeeze(logits))
         correct = (predictions == labels).sum().item()
         accuracy = correct/pixel_values.shape[0]
+
         if test:
-            return loss, accuracy, predictions
+            # auroc = AUROC(pos_label=1)
+            # auc_precision_recall = auroc(torch.squeeze(logits), labels)
+
+            # self.preds.append(torch.squeeze(logits))
+            # self.labels.append(labels)
+            return (loss, accuracy, logits, labels)
         return loss, accuracy
       
     def training_step(self, batch, batch_idx):
-        loss, accuracy = self.common_step(batch, batch_idx)     
+        if len(self.labels) > 0:
+            self.preds = []
+            self.labels = []
+        loss, accuracy = self.common_step(batch, batch_idx, test=False)     
         # logs metrics for each training_step,
         # and the average across the epoch
         self.log("training_loss", loss)
         self.log("training_accuracy", accuracy)
+        # self.log("pr_auc", accuracy, on_epoch=True)    
+        self.logger.agg_and_log_metrics({"training_loss": loss})   
+        self.logger.agg_and_log_metrics({"training_accuracy": accuracy})    
 
         return loss
     
     def validation_step(self, batch, batch_idx):
-        loss, accuracy = self.common_step(batch, batch_idx)     
+        loss, accuracy, logits, labels = self.common_step(batch, batch_idx, True)     
         self.log("validation_loss", loss, on_epoch=True)
         self.log("validation_accuracy", accuracy, on_epoch=True)
+        # self.log("validation_roc_auc_gathering", roc_auc, on_epoch=True)
+        self.logger.agg_and_log_metrics({"validation_loss": loss})   
+        self.logger.agg_and_log_metrics({"validation_accuracy": accuracy})    
 
-        return loss
+        return logits, labels
+
+    def validation_epoch_end(self, validation_step_outputs):
+        # outputs = torch.stack(validation_step_outputs)
+        all_labels = []
+        all_preds = []
+        all_logits = []
+        for out in validation_step_outputs:
+            for logits, label in zip(*out):
+                predictions = torch.round(torch.squeeze(logits))
+                all_labels.append(label.item())
+                all_preds.append(predictions.item())
+                all_logits.append(torch.squeeze(logits).item())
+
+        pr_curve = PrecisionRecallCurve(pos_label=1)
+        # precision, recall, thresholds = pr_curve(torch.cat(self.preds), torch.cat(self.labels))
+        # auc_precision_recall = auc(precision, recall, reorder=True)
+        precision, recall, thresholds = pr_curve(torch.tensor(all_logits), torch.tensor(all_labels))
+        auc_precision_recall = auc(precision, recall, reorder=True)
+        self.log("val_pr_auc", auc_precision_recall.item())
+        print(f"Val_preds: {len(all_preds)}")
+
+
+        self.logger.log_metrics({"val_pr_auc": auc_precision_recall.item()})
+
+        return auc_precision_recall
+
 
     def test_step(self, batch, batch_idx):
-        loss, accuracy, preds = self.common_step(batch, batch_idx, test=True)     
+        loss, accuracy, preds, labels = self.common_step(batch, batch_idx, test=True)     
         self.log("Test_loss", loss, on_epoch=True)
-        self.log("Test_Accuracy", accuracy, on_epoch=True)  
-        return loss, accuracy, preds
+        self.log("Test_Accuracy", accuracy, on_epoch=True) 
+        # self.log("Test_roc_auc_gathering", roc_auc, on_epoch=True)
+        self.logger.agg_and_log_metrics({"test_loss": loss})   
+        self.logger.agg_and_log_metrics({"test_accuracy": accuracy}) 
+
+        return preds, labels
+
+    def test_epoch_end(self, outputs):
+        all_labels = []
+        all_preds = []
+        all_logits = []
+        for out in outputs:
+            for logits, label in zip(*out):
+                predictions = torch.round(torch.squeeze(logits))
+                all_labels.append(label.item())
+                all_preds.append(predictions.item())
+                all_logits.append(torch.squeeze(logits).item())
+
+        conf_mat = confusion_matrix(all_labels, all_preds)
+        print('Confusion Matrix:',conf_mat)
+
+        tpr = fpr = None 
+        fpr, tpr, thresholds = sklearn.metrics.roc_curve(all_labels, all_logits)
+        stats = TransformerClassifier.create_auth_report(pd.Series(all_labels), pd.Series(all_logits), reversed(thresholds))
+
+        pd.options.display.float_format = '{:.2f}'.format
+        print(stats)
+        script_name = '/home/ubuntu/rebag/code/transformer/script'
+        stats.to_csv(os.path.join(script_name, 'stats.csv'), index=False)
+        TransformerClassifier.draw_sensitivity_and_specificity(stats, self.logger, script_name)
+
+        sensitivity = float(conf_mat[1][1]) / (conf_mat[1][1] + conf_mat[1][0])
+        specificity = float(conf_mat[0][0]) / (conf_mat[0][0] + conf_mat[0][1])
+        trustworthy_real_predictions = float(conf_mat[0][0]) / (conf_mat[0][0] + conf_mat[1][0])
+        self.logger.log_confusion_matrix(matrix=conf_mat, labels=all_labels)
+
+        self.logger.log_table("stats.csv", tabular_data=stats)
+        self.logger.log_metric('test_accuracy', sklearn.metrics.accuracy_score(all_labels, all_preds))
+        self.logger.log_metric('test_recall', sklearn.metrics.recall_score(all_labels, all_preds))
+        self.logger.log_metric('sensitivity_at_0.5', sensitivity)
+        self.logger.log_metric('specificity_at_0.5', specificity)
+        self.logger.log_metric('trustworthy_real_predictions', trustworthy_real_predictions)
+        if tpr is not None and fpr is not None:
+            self.logger.log_curve("roc-curve", fpr, tpr)
+            self.logger.log_metric("roc-auc", sklearn.metrics.auc(fpr, tpr))
+        self.logger.log_dataset_info("transformer_models")
+
+
+        # print(f"Test_preds: {len(all_preds)}")
+        # auroc = AUROC(pos_label=1)
+        # roc_auc = auroc(torch.tensor(all_logits), torch.tensor(all_labels))
+        # self.logger.log_metrics({"test_roc_auc": roc_auc})
+        return
+
+    @staticmethod
+    def draw_sensitivity_and_specificity(stats, experiment, script_name):
+        sensitivity_specificity_path = os.path.join(script_name, "sensitivity_and_specificity.png")
+        stats = stats[stats['threshold']<1]
+        plt.plot(stats['threshold'], stats['sensitivity'])
+        plt.plot(stats['threshold'], stats['specificity'])
+        plt.xlabel("Threshold")
+        plt.legend(['sensitivity', 'specificity'])
+        plt.savefig(sensitivity_specificity_path)
+        plt.close()
+        if experiment:
+            experiment.log_graph(sensitivity_specificity_path, "sensitivity_and_specificity.png")
+
+
+    @staticmethod
+    def create_auth_report(y_true, y_pred, threshold):
+        y_true = y_true.reset_index(drop=True)
+        y_pred = y_pred.reset_index(drop=True)
+        filtered_idx = y_pred[y_pred >= 0].index
+        y_pred = y_pred.loc[filtered_idx]
+        y_true = y_true.loc[filtered_idx]
+
+        def create_cols(row):
+            threshold = row['threshold']
+
+            if isinstance(y_pred.iloc[0], np.ndarray):
+                y_pred_adjusted = y_pred.apply(lambda prd: np.round(np.mean([0 if x < threshold else 1 for x in prd])))
+            else:
+                y_pred_adjusted = y_pred.apply(lambda prd: 0 if prd < threshold else 1)
+
+            tp = ((y_true == 1) & (y_pred_adjusted == 1)).sum()
+            fn = ((y_true == 1) & (y_pred_adjusted == 0)).sum()
+            fp = ((y_true == 0) & (y_pred_adjusted == 1)).sum()
+            tn = ((y_true == 0) & (y_pred_adjusted == 0)).sum()
+
+            row['threshold'] = threshold
+            row['sensitivity'] = tp / (tp + fn)
+            row['specificity'] = tn / (tn + fp)
+            row['npv'] = tn / (tn + fn) if tn + fn else None
+            row['time_saved'] = (tn + fn) / (tp + fn + fp + tn)
+            row['tp'] = int(tp)
+            row['fn'] = int(fn)
+            row['fp'] = int(fp)
+            row['tn'] = int(tn)
+            return row
+
+        if isinstance(threshold, float):
+            threshold = [threshold]
+        data = pd.DataFrame({'threshold': threshold}).apply(create_cols, axis=1)
+        data['tp'] = data['tp'].astype(int)
+        data['tn'] = data['tn'].astype(int)
+        data['fp'] = data['fp'].astype(int)
+        data['fn'] = data['fn'].astype(int)
+        return data
+
+
 
     def configure_optimizers(self):
         return AdamW(self.parameters(), lr=5e-5)
@@ -212,15 +376,28 @@ if __name__ == '__main__':
     # import os
     # os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
     early_stop_callback = EarlyStopping(
-        monitor='val_loss',
+        monitor='validation_loss',
         patience=3,
         strict=False,
         verbose=True,
         mode='min'
     )
 
-    model = ViTLightningModule()
-    trainer = Trainer(logger=comet_logger, gpus=1, callbacks=[early_stop_callback], max_epochs=2, default_root_dir='./', log_every_n_steps=10)
+    # train_params = {
+    #     "logger":comet_logger, "gpus":1, "callbacks":[early_stop_callback, checkpoint_callback], "max_epochs":1, "default_root_dir":'./', "log_every_n_steps"10
+
+    # }
+
+    checkpoint_callback = ModelCheckpoint(monitor="val_pr_auc")
+
+    model = TransformerClassifier()
+    trainer = Trainer(logger=comet_logger, gpus=1, callbacks=[early_stop_callback, checkpoint_callback], max_epochs=1, default_root_dir='./', log_every_n_steps=10)
+    model.labels = []
+    model.preds = []
     trainer.fit(model)
-    print(trainer.test(ckpt_path='best'))
+    trainer.test(ckpt_path='best')
+    # auroc = AUROC(pos_label=1)
+    # roc_auc = auroc(torch.cat(model.preds), torch.cat(model.labels))
+    # comet_logger.log_metrics({"test_roc_auc": roc_auc})
+    # print(f"roc_auc: {roc_auc}")
 
