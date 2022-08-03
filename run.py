@@ -1,7 +1,8 @@
+from cProfile import label
 from comet_ml import Experiment, OfflineExperiment, ExistingOfflineExperiment
 from PIL import Image
 import ast
-import os
+import os, cv2
 import matplotlib.pyplot as plt
 import sklearn
 import torch
@@ -36,27 +37,28 @@ from torchmetrics import PrecisionRecallCurve, AUROC
 from torchmetrics.functional import auc
 from sklearn.metrics import classification_report, confusion_matrix
 import seaborn as sns
+import PIL
 
 
 comet_params = dict(
-    save_dir='./comet',
-    offline=True,
+    # save_dir='./comet',
+    # offline=True,
     workspace="",
     project_name="",
     api_key="",
     auto_metric_logging=True,
     auto_param_logging=True,
-    experiment_name = "transformer_on_brand_code_only_old_data"
+    # experiment_name = "transformer_on_brand_code_only_old_data"
 )
 
-# experiment = OfflineExperiment(
-#     offline_directory='./comet',
-#     **comet_params
-# )
+experiment = OfflineExperiment(
+    offline_directory='./comet',
+    **comet_params
+)
 
-train_batch_size = 64
-eval_batch_size = 64
-comet_logger = pl_loggers.CometLogger(**comet_params)
+train_batch_size = 16
+eval_batch_size = 16
+# comet_logger = pl_loggers.CometLogger(**comet_params)
 
 feature_extractor = ViTFeatureExtractor.from_pretrained("google/vit-base-patch16-224-in21k")
 # print(feature_extractor.size)
@@ -80,51 +82,67 @@ _val_transforms = Compose(
             normalize,
         ]
     )
+
 class CustomDataset(Dataset):
-    def __init__(self, df):
-        self.img_path_list = df["img_path_list"].values
+    def __init__(self, df, preprocessing='val'):
+        self.img_path_list = df["img_path_list"].values 
         self.labels = df["label"].values
         self.size = len(self.labels)
+        self.preprocessing = preprocessing
                 
     def __getitem__(self, index):
-        return self.img_path_list[index], self.labels[index]
+        img = Image.open(self.img_path_list[index][0])
+        label = self.labels[index]
+        w, h = img.size
+        if h>w:
+            img = img.rotate(-90, PIL.Image.NEAREST, expand = 1)
+
+        if self.preprocessing=='train':
+            img = _train_transforms(img.convert("RGB"))
+            if self.labels[index] == 1:
+#                 print(f"Original size: {img.shape}")
+                rot_img = self.rotate(img)
+                yield rot_img.numpy(), label
+                int_img = (self.intensity(img))
+                yield int_img.numpy(), label
+        else:
+            img = _val_transforms(img.convert("RGB")) 
+
+        yield img.numpy(), label
     
     def __len__(self):
         return self.size
+    
+    @staticmethod
+    def intensity(img):
+        transform = transforms.ToPILImage()
+        img = transform(img)
+        brightness_factor=torch.FloatTensor(1).uniform_(0.4, 0.8).item()
+        enhancer = PIL.ImageEnhance.Brightness(img)
+        img2 = enhancer.enhance(brightness_factor)
+        transform = transforms.ToTensor()
+        return transform(img2)
+    
+    @staticmethod
+    def rotate(img):
+        ANG_THRSEH = 10
+        transform = transforms.ToPILImage()
+        img = transform(img)
+        ang = torch.FloatTensor(1).uniform_(-ANG_THRSEH, ANG_THRSEH).item()
+        transform = transforms.ToTensor()
+        return transform(img.rotate(ang, PIL.Image.NEAREST))
 
 
-class Collate:
-    def __init__(self, preprocessing="val"):
-        self.preprocessing = preprocessing
-        
-    def __call__(self, batch):
-        bag_list=[]
-        labels_list = []
-        for data in batch:
-#             for img_path, label in data:
-            img_list = []
-            for single_path in data[0]:
-                if single_path is not None:
-                    img = Image.open(single_path)                    
-                    if self.preprocessing=="train":
-                        img = _train_transforms(img.convert("RGB"))
-                    else:
-                        img = _val_transforms(img.convert("RGB"))
-                    img_list.append(img.numpy())
-                else:
-                    img_list.append(np.zeros(img_size))
-
-
-            img_tensor = torch.as_tensor(img_list[0])  
-            bag_list.append(img_tensor.numpy())
-            labels_list.append(data[1])
-#             yield (img_tensor, label)
-
-        bag_tensor = torch.tensor(bag_list)
-        labels_tensor = torch.tensor(labels_list)
-        
-        return {"pixel_values": bag_tensor, "labels": labels_tensor}
-
+def collate_fn(batch):
+    img_list = []
+    label_list = []
+    for data_gen in batch:
+        for img, label in data_gen:
+            img_list.append(img)
+            label_list.append(label)
+    bag_tensor = torch.tensor(img_list)
+    labels_tensor = torch.tensor(label_list)
+    return {"pixel_values": bag_tensor, "labels": labels_tensor}
 
 class TransformerClassifier(pl.LightningModule):
     def __init__(self, num_labels=1):
@@ -172,18 +190,43 @@ class TransformerClassifier(pl.LightningModule):
         self.log("training_loss", loss)
         self.log("training_accuracy", accuracy)
         # self.log("pr_auc", accuracy, on_epoch=True)    
-        self.logger.agg_and_log_metrics({"training_loss": loss})   
-        self.logger.agg_and_log_metrics({"training_accuracy": accuracy})    
-
+        # experiment.agg_and_log_metrics({"training_loss": loss})   
+        # experiment.agg_and_log_metrics({"training_accuracy": accuracy})    
+        # print(f"training; {loss}")
         return loss
+
+    # def training_epoch_end(self, outputs):
+    #     # outputs = torch.stack(validation_step_outputs)
+    #     all_labels = []
+    #     all_preds = []
+    #     all_logits = []
+    #     all_loss = []
+    #     print(outputs)
+    #     for out in outputs:
+    #         for logits, label, loss in zip(*out):
+    #             predictions = torch.round(torch.squeeze(logits))
+    #             all_labels.append(label.item())
+    #             all_preds.append(predictions.item())
+    #             all_logits.append(torch.squeeze(logits).item())
+    #             all_loss.append(torch.squeeze(loss).item())
+
+    #     pr_curve = PrecisionRecallCurve(pos_label=1)
+    #     precision, recall, thresholds = pr_curve(torch.tensor(all_logits), torch.tensor(all_labels))
+    #     auc_precision_recall = auc(precision, recall, reorder=True)
+        # self.log("train_pr_auc", auc_precision_recall.item())
+        # total_loss = sum(loss)/len(loss)
+        # print(f"Training loss for the epoch is: {total_loss}")
+        # experiment.log_metric("training_loss_for_epoch", total_loss)
+        # experiment.log_metric("train_pr_auc", auc_precision_recall.item())
+        # return auc_precision_recall
     
     def validation_step(self, batch, batch_idx):
         loss, accuracy, logits, labels = self.common_step(batch, batch_idx, True)     
         self.log("validation_loss", loss, on_epoch=True)
         self.log("validation_accuracy", accuracy, on_epoch=True)
         # self.log("validation_roc_auc_gathering", roc_auc, on_epoch=True)
-        self.logger.agg_and_log_metrics({"validation_loss": loss})   
-        self.logger.agg_and_log_metrics({"validation_accuracy": accuracy})    
+        # experiment.agg_and_log_metrics({"validation_loss": loss})   
+        # experiment.agg_and_log_metrics({"validation_accuracy": accuracy})    
 
         return logits, labels
 
@@ -200,16 +243,11 @@ class TransformerClassifier(pl.LightningModule):
                 all_logits.append(torch.squeeze(logits).item())
 
         pr_curve = PrecisionRecallCurve(pos_label=1)
-        # precision, recall, thresholds = pr_curve(torch.cat(self.preds), torch.cat(self.labels))
-        # auc_precision_recall = auc(precision, recall, reorder=True)
         precision, recall, thresholds = pr_curve(torch.tensor(all_logits), torch.tensor(all_labels))
         auc_precision_recall = auc(precision, recall, reorder=True)
         self.log("val_pr_auc", auc_precision_recall.item())
         print(f"Val_preds: {len(all_preds)}")
-
-
-        self.logger.log_metrics({"val_pr_auc": auc_precision_recall.item()})
-
+        experiment.log_metric("val_pr_auc", auc_precision_recall.item())
         return auc_precision_recall
 
 
@@ -218,8 +256,8 @@ class TransformerClassifier(pl.LightningModule):
         self.log("Test_loss", loss, on_epoch=True)
         self.log("Test_Accuracy", accuracy, on_epoch=True) 
         # self.log("Test_roc_auc_gathering", roc_auc, on_epoch=True)
-        self.logger.agg_and_log_metrics({"test_loss": loss})   
-        self.logger.agg_and_log_metrics({"test_accuracy": accuracy}) 
+        # experiment.agg_and_log_metrics({"test_loss": loss})   
+        # experiment.agg_and_log_metrics({"test_accuracy": accuracy}) 
 
         return preds, labels
 
@@ -246,34 +284,30 @@ class TransformerClassifier(pl.LightningModule):
         print(stats)
         script_name = '/home/ubuntu/rebag/code/transformer/script'
         stats.to_csv(os.path.join(script_name, 'stats.csv'), index=False)
-        TransformerClassifier.draw_sensitivity_and_specificity(stats, self.logger, script_name)
+        TransformerClassifier.draw_sensitivity_and_specificity(stats, script_name)
         TransformerClassifier.plot_confusion_matrix(conf_mat, category_names, script_name)
 
         sensitivity = float(conf_mat[1][1]) / (conf_mat[1][1] + conf_mat[1][0])
         specificity = float(conf_mat[0][0]) / (conf_mat[0][0] + conf_mat[0][1])
         trustworthy_real_predictions = float(conf_mat[0][0]) / (conf_mat[0][0] + conf_mat[1][0])
-        # self.logger.log_confusion_matrix(matrix=conf_mat, labels=all_labels)
+        experiment.log_confusion_matrix(matrix=conf_mat, labels=all_labels)
 
-        # self.logger.log_table("stats.csv", tabular_data=stats)
-        self.logger.log_metrics({'test_accuracy': sklearn.metrics.accuracy_score(all_labels, all_preds)})
-        self.logger.log_metrics({'test_recall': sklearn.metrics.recall_score(all_labels, all_preds)})
-        self.logger.log_metrics({'sensitivity_at_0.5': sensitivity})
-        self.logger.log_metrics({'specificity_at_0.5': specificity})
-        self.logger.log_metrics({'trustworthy_real_predictions': trustworthy_real_predictions})
+        experiment.log_table("stats.csv", tabular_data=stats)
+        experiment.log_metric('test_accuracy', sklearn.metrics.accuracy_score(all_labels, all_preds))
+        experiment.log_metric('test_recall', sklearn.metrics.recall_score(all_labels, all_preds))
+        experiment.log_metric('sensitivity_at_0.5', sensitivity)
+        experiment.log_metric('specificity_at_0.5', specificity)
+        experiment.log_metric('trustworthy_real_predictions', trustworthy_real_predictions)
         if tpr is not None and fpr is not None:
-            # self.logger.log_curve("roc-curve", fpr, tpr)
-            self.logger.log_metrics({"test-roc-auc": sklearn.metrics.auc(fpr, tpr)})
-        # self.logger.log_dataset_info("transformer_models")
+            experiment.log_curve("roc-curve", fpr, tpr)
+            experiment.log_metric("test-roc-auc", sklearn.metrics.auc(fpr, tpr))
+        experiment.log_dataset_info("transformer_models")
 
-
-        # print(f"Test_preds: {len(all_preds)}")
-        # auroc = AUROC(pos_label=1)
-        # roc_auc = auroc(torch.tensor(all_logits), torch.tensor(all_labels))
-        # self.logger.log_metrics({"test_roc_auc": roc_auc})
         return
 
     @staticmethod
-    def draw_sensitivity_and_specificity(stats, experiment, script_name):
+    def draw_sensitivity_and_specificity(stats, script_name):
+        global experiment
         sensitivity_specificity_path = os.path.join(script_name, "sensitivity_and_specificity.png")
         stats = stats[stats['threshold']<1]
         plt.plot(stats['threshold'], stats['sensitivity'])
@@ -282,11 +316,13 @@ class TransformerClassifier(pl.LightningModule):
         plt.legend(['sensitivity', 'specificity'])
         plt.savefig(sensitivity_specificity_path)
         plt.close()
+        print(type(experiment))
         # if experiment:
-        #     experiment.log_graph(sensitivity_specificity_path, "sensitivity_and_specificity.png")
+        experiment.log_image(sensitivity_specificity_path, "sensitivity_and_specificity.png")
 
     @staticmethod
     def plot_confusion_matrix(cnf_mat, category_names, path):
+        global experiment
         plt.figure(figsize=(6, 6))
         plt.title("Confusion Matrix")
         sns.heatmap(cnf_mat, annot=True, cbar=False, linewidth=0.5, fmt="d")
@@ -294,7 +330,10 @@ class TransformerClassifier(pl.LightningModule):
         plt.yticks(np.arange(len(category_names)) + 0.5, category_names)
         plt.ylabel("Actual Category")
         plt.xlabel("Predicted Category")
-        plt.savefig(os.path.join(path, 'conf_matrix.png'))
+        cf_matrix_path = os.path.join(path, 'conf_matrix.png')
+        plt.savefig(cf_matrix_path)
+        plt.close()
+        experiment.log_image(cf_matrix_path, 'conf_matrix.png')
 
     @staticmethod
     def create_auth_report(y_true, y_pred, threshold):
@@ -353,6 +392,7 @@ class TransformerClassifier(pl.LightningModule):
 
 
 if __name__ == '__main__':
+    torch.manual_seed(1)
     train_df = pd.read_csv("/home/ubuntu/rebag/code/notebooks/real_sample_fake_unsample_train.csv")
     val_df = pd.read_csv("/home/ubuntu/rebag/code/notebooks/real_fake_sample_val.csv")
     test_df = pd.read_csv("/home/ubuntu/rebag/code/notebooks/real_fake_sample_test.csv")
@@ -373,18 +413,13 @@ if __name__ == '__main__':
     # print(train_df['label'].value_counts())
     # exit()
 
-    train_dataset = CustomDataset(train_df)
+    train_dataset = CustomDataset(train_df, preprocessing='train')
     val_dataset = CustomDataset(val_df)
     test_dataset = CustomDataset(test_df)
 
-    
-    train_collate_fn = Collate("train")
-    val_collate_fn = Collate()
-    test_collate_fn = Collate()
-
-    train_dataloader = DataLoader(train_dataset, shuffle=True, collate_fn=train_collate_fn, batch_size=train_batch_size)
-    val_dataloader = DataLoader(val_dataset, collate_fn=val_collate_fn, batch_size=eval_batch_size)
-    test_dataloader = DataLoader(test_dataset, collate_fn=test_collate_fn, batch_size=eval_batch_size)
+    train_dataloader = DataLoader(train_dataset, shuffle=True, collate_fn=collate_fn, batch_size=train_batch_size)
+    val_dataloader = DataLoader(val_dataset, collate_fn=collate_fn, batch_size=eval_batch_size)
+    test_dataloader = DataLoader(test_dataset, collate_fn=collate_fn, batch_size=eval_batch_size)
 
     # import os
     # os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
@@ -404,7 +439,8 @@ if __name__ == '__main__':
     checkpoint_callback = ModelCheckpoint(monitor="val_pr_auc")
 
     model = TransformerClassifier()
-    trainer = Trainer(logger=comet_logger, gpus=1, callbacks=[early_stop_callback, checkpoint_callback], max_epochs=25, default_root_dir='./', log_every_n_steps=10)
+    trainer = Trainer(gpus=1, callbacks=[checkpoint_callback], max_epochs=25, default_root_dir='./', log_every_n_steps=10)
     trainer.fit(model)
     trainer.test(ckpt_path='best')
+    # trainer.test(model, ckpt_path='/home/ubuntu/rebag/code/transformer/lightning_logs/version_1/checkpoints/epoch=0-step=193.ckpt')
 
