@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 import sklearn
 import torch
 import torchvision.transforms as transforms
+from torchvision.transforms.functional import pad
 from transformers import ViTFeatureExtractor
 from torchvision.transforms import (CenterCrop, 
                                     Compose, 
@@ -38,6 +39,7 @@ from torchmetrics.functional import auc
 from sklearn.metrics import classification_report, confusion_matrix
 import seaborn as sns
 import PIL
+import numbers
 
 
 comet_params = dict(
@@ -56,28 +58,64 @@ experiment = OfflineExperiment(
     **comet_params
 )
 
-train_batch_size = 16
-eval_batch_size = 16
+batch_size = 16
 # comet_logger = pl_loggers.CometLogger(**comet_params)
 
 feature_extractor = ViTFeatureExtractor.from_pretrained("google/vit-base-patch16-224-in21k")
 # print(feature_extractor.size)
 img_size = (3,224,224)
+n_aoi = 10
 normalize = Normalize(mean=feature_extractor.image_mean, std=feature_extractor.image_std)
+def get_padding(image):    
+    w, h = image.size
+    max_wh = np.max([w, h])
+    h_padding = (max_wh - w) / 2
+    v_padding = (max_wh - h) / 2
+    l_pad = h_padding if h_padding % 1 == 0 else h_padding+0.5
+    t_pad = v_padding if v_padding % 1 == 0 else v_padding+0.5
+    r_pad = h_padding if h_padding % 1 == 0 else h_padding-0.5
+    b_pad = v_padding if v_padding % 1 == 0 else v_padding-0.5
+    padding = (int(l_pad),  int(t_pad),int(r_pad), int(b_pad))
+    return padding
+
+class SquarePad(object):
+    def __init__(self, fill=0, padding_mode='constant'):
+        assert isinstance(fill, (numbers.Number, str, tuple))
+        assert padding_mode in ['constant', 'edge', 'reflect', 'symmetric']
+
+        self.fill = fill
+        self.padding_mode = padding_mode
+        
+    def __call__(self, img):
+        """
+        Args:
+            img (PIL Image): Image to be padded.
+
+        Returns:
+            PIL Image: Padded image.
+        """
+        return pad(img, get_padding(img), self.fill, self.padding_mode)
+    
+    def __repr__(self):
+        return self.__class__.__name__ + '(padding={0}, fill={1}, padding_mode={2})'.\
+            format(self.fill, self.padding_mode)
+
+
 _train_transforms = Compose(
-        [
-            RandomResizedCrop(feature_extractor.size),
-            # RandomHorizontalFlip(),
-            RandomRotation(degrees=(-10, 10)),
+        [   
+            SquarePad(),
+            Resize(feature_extractor.size),
+            # CenterCrop(feature_extractor.size),
+            # RandomRotation(degrees=(-10, 10)),
             ToTensor(),
             normalize,
         ]
     )
 
 _val_transforms = Compose(
-        [
+        [  
+            SquarePad(),
             Resize(feature_extractor.size),
-            CenterCrop(feature_extractor.size),
             ToTensor(),
             normalize,
         ]
@@ -91,24 +129,32 @@ class CustomDataset(Dataset):
         self.preprocessing = preprocessing
                 
     def __getitem__(self, index):
-        img = Image.open(self.img_path_list[index][0])
         label = self.labels[index]
-        w, h = img.size
-        if h>w:
-            img = img.rotate(-90, PIL.Image.NEAREST, expand = 1)
-
-        if self.preprocessing=='train':
-            img = _train_transforms(img.convert("RGB"))
-            if self.labels[index] == 1:
-#                 print(f"Original size: {img.shape}")
-                rot_img = self.rotate(img)
-                yield rot_img.numpy(), label
-                int_img = (self.intensity(img))
-                yield int_img.numpy(), label
-        else:
-            img = _val_transforms(img.convert("RGB")) 
-
-        yield img.numpy(), label
+        img_list = []
+        for img_path in self.img_path_list[index]:
+            if img_path is not None:
+                img = Image.open(img_path)
+                w, h = img.size
+                if h>w:
+                    img = img.rotate(-90, PIL.Image.NEAREST, expand = 1)
+                
+        
+                if self.preprocessing=='train':
+                    img = _train_transforms(img.convert("RGB"))
+#             if self.labels[index] == 1:
+# #                 print(f"Original size: {img.shape}")
+#                 rot_img = self.rotate(img)
+#                 yield rot_img.numpy(), label
+#                 int_img = (self.intensity(img))
+#                 yield int_img.numpy(), label
+                else:
+                    img = _val_transforms(img.convert("RGB"))
+                img_list.append(img)
+            else:
+                img_list.append(torch.zeros((img_size)))
+        
+        img_tensor = torch.stack(img_list)  
+        yield img_tensor.numpy(), label
     
     def __len__(self):
         return self.size
@@ -152,11 +198,14 @@ class TransformerClassifier(pl.LightningModule):
                                                               id2label={0:"Real"},
                                                               label2id={"Real":0})
         self.sig = nn.Sigmoid()
+        print("Initialised")
         # self.preds = []
         # self.labels = []
 
     def forward(self, pixel_values):
+        print("Calling forward")
         outputs = self.vit(pixel_values=pixel_values)
+        print("Outputs:",outputs.logits.shape)
         return self.sig(outputs.logits)
         
     def common_step(self, batch, batch_idx, test=False):
@@ -178,47 +227,28 @@ class TransformerClassifier(pl.LightningModule):
             # self.preds.append(torch.squeeze(logits))
             # self.labels.append(labels)
             return (loss, accuracy, logits, labels)
-        return loss, accuracy
+        return loss, accuracy, logits, labels
       
     def training_step(self, batch, batch_idx):
         # if len(self.labels) > 0:
         #     self.preds = []
         #     self.labels = []
-        loss, accuracy = self.common_step(batch, batch_idx, test=False)     
+        loss, accuracy, logits, labels = self.common_step(batch, batch_idx, test=False)     
         # logs metrics for each training_step,
         # and the average across the epoch
         self.log("training_loss", loss)
         self.log("training_accuracy", accuracy)
+
+        pr_curve = PrecisionRecallCurve(num_classes = 1, pos_label=1)
+        precision, recall, thresholds = pr_curve(logits, labels)
+        auc_precision_recall = auc(precision, recall, reorder=True)
+        self.log("pr_auc", auc_precision_recall.item())
+        print(f" pr_auc: {(auc_precision_recall.item()):>0.6f}%,\n")
         # self.log("pr_auc", accuracy, on_epoch=True)    
         # experiment.agg_and_log_metrics({"training_loss": loss})   
         # experiment.agg_and_log_metrics({"training_accuracy": accuracy})    
         # print(f"training; {loss}")
-        return loss
-
-    # def training_epoch_end(self, outputs):
-    #     # outputs = torch.stack(validation_step_outputs)
-    #     all_labels = []
-    #     all_preds = []
-    #     all_logits = []
-    #     all_loss = []
-    #     print(outputs)
-    #     for out in outputs:
-    #         for logits, label, loss in zip(*out):
-    #             predictions = torch.round(torch.squeeze(logits))
-    #             all_labels.append(label.item())
-    #             all_preds.append(predictions.item())
-    #             all_logits.append(torch.squeeze(logits).item())
-    #             all_loss.append(torch.squeeze(loss).item())
-
-    #     pr_curve = PrecisionRecallCurve(pos_label=1)
-    #     precision, recall, thresholds = pr_curve(torch.tensor(all_logits), torch.tensor(all_labels))
-    #     auc_precision_recall = auc(precision, recall, reorder=True)
-        # self.log("train_pr_auc", auc_precision_recall.item())
-        # total_loss = sum(loss)/len(loss)
-        # print(f"Training loss for the epoch is: {total_loss}")
-        # experiment.log_metric("training_loss_for_epoch", total_loss)
-        # experiment.log_metric("train_pr_auc", auc_precision_recall.item())
-        # return auc_precision_recall
+        return {'loss':loss , 'accuracy':accuracy, 'pr_auc':auc_precision_recall}
     
     def validation_step(self, batch, batch_idx):
         loss, accuracy, logits, labels = self.common_step(batch, batch_idx, True)     
@@ -247,6 +277,7 @@ class TransformerClassifier(pl.LightningModule):
         auc_precision_recall = auc(precision, recall, reorder=True)
         self.log("val_pr_auc", auc_precision_recall.item())
         print(f"Val_preds: {len(all_preds)}")
+        print(f"Val_pr_auc: {auc_precision_recall.item()}")
         experiment.log_metric("val_pr_auc", auc_precision_recall.item())
         return auc_precision_recall
 
@@ -275,6 +306,8 @@ class TransformerClassifier(pl.LightningModule):
 
         conf_mat = confusion_matrix(all_labels, all_preds)
         print('Confusion Matrix:',conf_mat)
+        labels = ["Real", "Fake"]
+        experiment.log_confusion_matrix(matrix=conf_mat, labels=labels)
 
         tpr = fpr = None 
         fpr, tpr, thresholds = sklearn.metrics.roc_curve(all_labels, all_logits)
@@ -333,7 +366,7 @@ class TransformerClassifier(pl.LightningModule):
         cf_matrix_path = os.path.join(path, 'conf_matrix.png')
         plt.savefig(cf_matrix_path)
         plt.close()
-        experiment.log_image(cf_matrix_path, 'conf_matrix.png')
+        # experiment.log_image(cf_matrix_path, 'conf_matrix.png')
 
     @staticmethod
     def create_auth_report(y_true, y_pred, threshold):
@@ -401,13 +434,13 @@ if __name__ == '__main__':
     val_df['img_path_list'] = val_df['img_path_list'].apply(lambda x: ast.literal_eval(x))
     test_df['img_path_list'] = test_df['img_path_list'].apply(lambda x: ast.literal_eval(x))
 
-    train_df = train_df[train_df['img_path_list'].apply(lambda x: True if x[0] is not None else False )]
-    val_df = val_df[val_df['img_path_list'].apply(lambda x: True if x[0] is not None else False )]
-    test_df = test_df[test_df['img_path_list'].apply(lambda x: True if x[0] is not None else False )]
+    # train_df = train_df[train_df['img_path_list'].apply(lambda x: True if x[0] is not None else False )]
+    # val_df = val_df[val_df['img_path_list'].apply(lambda x: True if x[0] is not None else False )]
+    # test_df = test_df[test_df['img_path_list'].apply(lambda x: True if x[0] is not None else False )]
 
-    train_df['img_path_list'] = train_df['img_path_list'].apply(lambda x: [x[0]])
-    val_df['img_path_list'] = val_df['img_path_list'].apply(lambda x: [x[0]])
-    test_df['img_path_list'] = test_df['img_path_list'].apply(lambda x: [x[0]])
+    # train_df['img_path_list'] = train_df['img_path_list'].apply(lambda x: [x[0]])
+    # val_df['img_path_list'] = val_df['img_path_list'].apply(lambda x: [x[0]])
+    # test_df['img_path_list'] = test_df['img_path_list'].apply(lambda x: [x[0]])
 
     # print(len(train_df))
     # print(train_df['label'].value_counts())
@@ -417,9 +450,15 @@ if __name__ == '__main__':
     val_dataset = CustomDataset(val_df)
     test_dataset = CustomDataset(test_df)
 
-    train_dataloader = DataLoader(train_dataset, shuffle=True, collate_fn=collate_fn, batch_size=train_batch_size)
-    val_dataloader = DataLoader(val_dataset, collate_fn=collate_fn, batch_size=eval_batch_size)
-    test_dataloader = DataLoader(test_dataset, collate_fn=collate_fn, batch_size=eval_batch_size)
+    train_dataloader = DataLoader(train_dataset, shuffle=True, collate_fn=collate_fn, batch_size=batch_size)
+    val_dataloader = DataLoader(val_dataset, collate_fn=collate_fn, batch_size=batch_size)
+    test_dataloader = DataLoader(test_dataset, collate_fn=collate_fn, batch_size=batch_size)
+
+    # for data in train_dataloader:
+    #     print(data['pixel_values'].size())
+    #     break
+    # exit()
+
 
     # import os
     # os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
