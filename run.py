@@ -18,14 +18,13 @@ from torchvision.transforms import (CenterCrop,
                                     Resize, 
                                     ToTensor)
 from torch.utils.data import DataLoader
-from transformers import ViTForImageClassification
 # from transformers import TrainingArguments, Trainer
 from datasets import load_metric
 import numpy as np
 import pandas as pd
 from torch.utils.data import Dataset
 import pytorch_lightning as pl
-from transformers import ViTForImageClassification, AdamW
+from transformers import ViTModel, AdamW
 import torch.nn as nn
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import EarlyStopping
@@ -58,13 +57,13 @@ experiment = OfflineExperiment(
     **comet_params
 )
 
-batch_size = 16
+batch_size = 12
 # comet_logger = pl_loggers.CometLogger(**comet_params)
 
 feature_extractor = ViTFeatureExtractor.from_pretrained("google/vit-base-patch16-224-in21k")
 # print(feature_extractor.size)
 img_size = (3,224,224)
-n_aoi = 10
+n_aoi=10
 normalize = Normalize(mean=feature_extractor.image_mean, std=feature_extractor.image_std)
 def get_padding(image):    
     w, h = image.size
@@ -141,12 +140,6 @@ class CustomDataset(Dataset):
         
                 if self.preprocessing=='train':
                     img = _train_transforms(img.convert("RGB"))
-#             if self.labels[index] == 1:
-# #                 print(f"Original size: {img.shape}")
-#                 rot_img = self.rotate(img)
-#                 yield rot_img.numpy(), label
-#                 int_img = (self.intensity(img))
-#                 yield int_img.numpy(), label
                 else:
                     img = _val_transforms(img.convert("RGB"))
                 img_list.append(img)
@@ -176,7 +169,7 @@ class CustomDataset(Dataset):
         img = transform(img)
         ang = torch.FloatTensor(1).uniform_(-ANG_THRSEH, ANG_THRSEH).item()
         transform = transforms.ToTensor()
-        return transform(img.rotate(ang, PIL.Image.NEAREST))
+        return transform(img.rotate(ang, Resampling.NEAREST))
 
 
 def collate_fn(batch):
@@ -193,20 +186,19 @@ def collate_fn(batch):
 class TransformerClassifier(pl.LightningModule):
     def __init__(self, num_labels=1):
         super(TransformerClassifier, self).__init__()
-        self.vit = ViTForImageClassification.from_pretrained('google/vit-base-patch16-224-in21k',
-                                                              num_labels=1,
-                                                              id2label={0:"Real"},
-                                                              label2id={"Real":0})
+        self.vit = ViTModel.from_pretrained('google/vit-base-patch16-224-in21k')
+        self.dense_1 = nn.Linear(768, 8)
+        self.dense_last = nn.Linear(80, 1)
         self.sig = nn.Sigmoid()
         print("Initialised")
-        # self.preds = []
-        # self.labels = []
-
+        
     def forward(self, pixel_values):
-        print("Calling forward")
-        outputs = self.vit(pixel_values=pixel_values)
-        print("Outputs:",outputs.logits.shape)
-        return self.sig(outputs.logits)
+        outputs = [self.vit(pixel_values=pixel_values[:,i], return_dict = False) for i in range(10)]
+        d_out_1 = [self.dense_1(outputs[i][1]) for i in range(10)]
+        concat = torch.cat(d_out_1,1)
+        d_out_last = self.dense_last(concat)
+        res = self.sig(d_out_last)
+        return res
         
     def common_step(self, batch, batch_idx, test=False):
         pixel_values = batch['pixel_values']
@@ -214,7 +206,6 @@ class TransformerClassifier(pl.LightningModule):
         logits = self(pixel_values)
 
         criterion = nn.BCELoss()
-        # print(logits)
         loss = criterion(torch.reshape(logits, (-1, 1)), torch.reshape(labels, (-1,1)).float())
         predictions = torch.round(torch.squeeze(logits))
         correct = (predictions == labels).sum().item()
@@ -230,9 +221,7 @@ class TransformerClassifier(pl.LightningModule):
         return loss, accuracy, logits, labels
       
     def training_step(self, batch, batch_idx):
-        # if len(self.labels) > 0:
-        #     self.preds = []
-        #     self.labels = []
+
         loss, accuracy, logits, labels = self.common_step(batch, batch_idx, test=False)     
         # logs metrics for each training_step,
         # and the average across the epoch
@@ -241,27 +230,19 @@ class TransformerClassifier(pl.LightningModule):
 
         pr_curve = PrecisionRecallCurve(num_classes = 1, pos_label=1)
         precision, recall, thresholds = pr_curve(logits, labels)
-        auc_precision_recall = auc(precision, recall, reorder=True)
+        auc_precision_recall = auc(recall, precision, reorder=True)
         self.log("pr_auc", auc_precision_recall.item())
         print(f" pr_auc: {(auc_precision_recall.item()):>0.6f}%,\n")
-        # self.log("pr_auc", accuracy, on_epoch=True)    
-        # experiment.agg_and_log_metrics({"training_loss": loss})   
-        # experiment.agg_and_log_metrics({"training_accuracy": accuracy})    
-        # print(f"training; {loss}")
         return {'loss':loss , 'accuracy':accuracy, 'pr_auc':auc_precision_recall}
     
     def validation_step(self, batch, batch_idx):
         loss, accuracy, logits, labels = self.common_step(batch, batch_idx, True)     
         self.log("validation_loss", loss, on_epoch=True)
-        self.log("validation_accuracy", accuracy, on_epoch=True)
-        # self.log("validation_roc_auc_gathering", roc_auc, on_epoch=True)
-        # experiment.agg_and_log_metrics({"validation_loss": loss})   
-        # experiment.agg_and_log_metrics({"validation_accuracy": accuracy})    
+        self.log("validation_accuracy", accuracy, on_epoch=True)   
 
         return logits, labels
 
     def validation_epoch_end(self, validation_step_outputs):
-        # outputs = torch.stack(validation_step_outputs)
         all_labels = []
         all_preds = []
         all_logits = []
@@ -274,7 +255,7 @@ class TransformerClassifier(pl.LightningModule):
 
         pr_curve = PrecisionRecallCurve(pos_label=1)
         precision, recall, thresholds = pr_curve(torch.tensor(all_logits), torch.tensor(all_labels))
-        auc_precision_recall = auc(precision, recall, reorder=True)
+        auc_precision_recall = auc(recall, precision, reorder=True)
         self.log("val_pr_auc", auc_precision_recall.item())
         print(f"Val_preds: {len(all_preds)}")
         print(f"Val_pr_auc: {auc_precision_recall.item()}")
@@ -285,11 +266,7 @@ class TransformerClassifier(pl.LightningModule):
     def test_step(self, batch, batch_idx):
         loss, accuracy, preds, labels = self.common_step(batch, batch_idx, test=True)     
         self.log("Test_loss", loss, on_epoch=True)
-        self.log("Test_Accuracy", accuracy, on_epoch=True) 
-        # self.log("Test_roc_auc_gathering", roc_auc, on_epoch=True)
-        # experiment.agg_and_log_metrics({"test_loss": loss})   
-        # experiment.agg_and_log_metrics({"test_accuracy": accuracy}) 
-
+        self.log("Test_Accuracy", accuracy, on_epoch=True)  
         return preds, labels
 
     def test_epoch_end(self, outputs):
@@ -323,7 +300,7 @@ class TransformerClassifier(pl.LightningModule):
         sensitivity = float(conf_mat[1][1]) / (conf_mat[1][1] + conf_mat[1][0])
         specificity = float(conf_mat[0][0]) / (conf_mat[0][0] + conf_mat[0][1])
         trustworthy_real_predictions = float(conf_mat[0][0]) / (conf_mat[0][0] + conf_mat[1][0])
-        experiment.log_confusion_matrix(matrix=conf_mat, labels=all_labels)
+        experiment.log_confusion_matrix(matrix=conf_mat, labels=labels)
 
         experiment.log_table("stats.csv", tabular_data=stats)
         experiment.log_metric('test_accuracy', sklearn.metrics.accuracy_score(all_labels, all_preds))
@@ -454,11 +431,6 @@ if __name__ == '__main__':
     val_dataloader = DataLoader(val_dataset, collate_fn=collate_fn, batch_size=batch_size)
     test_dataloader = DataLoader(test_dataset, collate_fn=collate_fn, batch_size=batch_size)
 
-    # for data in train_dataloader:
-    #     print(data['pixel_values'].size())
-    #     break
-    # exit()
-
 
     # import os
     # os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
@@ -470,12 +442,7 @@ if __name__ == '__main__':
         mode='min'
     )
 
-    # train_params = {
-    #     "logger":comet_logger, "gpus":1, "callbacks":[early_stop_callback, checkpoint_callback], "max_epochs":1, "default_root_dir":'./', "log_every_n_steps"10
-
-    # }
-
-    checkpoint_callback = ModelCheckpoint(monitor="val_pr_auc")
+    checkpoint_callback = ModelCheckpoint(monitor="val_pr_auc", mode='max')
 
     model = TransformerClassifier()
     trainer = Trainer(gpus=1, callbacks=[checkpoint_callback], max_epochs=25, default_root_dir='./', log_every_n_steps=10)
